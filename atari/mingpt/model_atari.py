@@ -122,6 +122,22 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
+# model_atari.py
+class QValueNetwork(nn.Module):
+    """独立的Q值网络，用于从GPT生成的状态嵌入中估计Q值。"""
+    
+    def __init__(self, n_embd):
+        super().__init__()
+        self.q_net = nn.Sequential(
+            nn.Linear(n_embd, n_embd // 2),
+            nn.ReLU(),
+            nn.Linear(n_embd // 2, 1)  # 输出为单一的Q值
+        )
+
+    def forward(self, state_embeddings):
+        # 假设输入是 (batch_size, sequence_length, n_embd)
+        q_values = self.q_net(state_embeddings)
+        return q_values  # 返回形状为 (batch_size, sequence_length, 1)
 
 class GPT(nn.Module):
     """GPT 模型，具有指定上下文长度 block_size，用于强化学习中的序列建模。"""
@@ -153,11 +169,11 @@ class GPT(nn.Module):
 
         # 状态编码器：将 4 帧 84x84 的图像状态嵌入为向量，用于强化学习中的视觉输入处理。
         # 状态编码 似乎仅仅是几个卷积，是否可以考虑其他形式？
-        self.state_encoder = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4, padding=0), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2, padding=0), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1, padding=0), nn.ReLU(),
-            nn.Flatten(), nn.Linear(3136, config.n_embd), nn.Tanh()
+        self.state_encoder = nn.Sequential( #4x84x84
+            nn.Conv2d(4, 32, 8, stride=4, padding=0), nn.ReLU(),# 32x(84-8+0)/4+1 =32x20x20
+            nn.Conv2d(32, 64, 4, stride=2, padding=0), nn.ReLU(), #64x9x9
+            nn.Conv2d(64, 64, 3, stride=1, padding=0), nn.ReLU(),#64x7x7
+            nn.Flatten(), nn.Linear(3136, config.n_embd), nn.Tanh() 
         )
 
         # 回报的嵌入层：用于将回报信息嵌入为向量。 把1维的东西变成这么多维度，是否有些不合理呢？
@@ -166,7 +182,13 @@ class GPT(nn.Module):
         # 动作的嵌入层：将离散的动作转换为嵌入向量，并初始化嵌入权重。
         self.action_embeddings = nn.Sequential(nn.Embedding(config.vocab_size, config.n_embd), nn.Tanh())
         nn.init.normal_(self.action_embeddings[0].weight, mean=0.0, std=0.02)
-
+        
+        # 添加 Q 值网络，用于计算每个状态-动作对的 Q 值
+        self.q_value_net = QValueNetwork(config.n_embd)
+    
+    # 新加：计算优势函数
+    def compute_advantage(self, q_values, baseline):
+        return q_values - baseline
     def get_block_size(self):
         # 返回模型的上下文长度（block_size）。
         return self.block_size
@@ -281,21 +303,34 @@ class GPT(nn.Module):
         x = self.ln_f(x)
         logits = self.head(x)
 
+
+        
+        # # 使用基于 IQL 的方法计算优势
+        # baseline = q_values.mean(dim=1, keepdim=True)  # 使用均值作为 baseline
+        # advantages = self.compute_advantage(q_values, baseline)
+        
+        # # 将优势作为加权因子应用于策略的输出
+        # logits = logits * advantages  # 用优势加权生成的动作选择
+        
         # 根据模型类型调整预测结果的形状
         if actions is not None and self.model_type == 'reward_conditioned':
             logits = logits[:, 1::3, :]  # 仅保留状态嵌入的预测
+            x = x[:, 1::3, :]    
         elif actions is None and self.model_type == 'reward_conditioned':
             logits = logits[:, 1:, :]
+            x = x[:, 1:, :]
         elif actions is not None and self.model_type == 'naive':
             logits = logits[:, ::2, :]  # 仅保留状态嵌入的预测
+            x = x[:, ::2, :]
         elif actions is None and self.model_type == 'naive':
             logits = logits
         else:
             raise NotImplementedError()
-
+        # # 计算 Q 值
+        q_values = self.q_value_net(x)
         # 如果提供了目标动作标签，计算交叉熵损失
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
-        return logits, loss
+        return logits, loss,q_values

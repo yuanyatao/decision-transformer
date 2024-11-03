@@ -33,7 +33,8 @@ import random
 import cv2
 import torch
 from PIL import Image
-
+import os
+import matplotlib.pyplot as plt
 class TrainerConfig:
     # optimization parameters
     max_epochs = 10
@@ -53,6 +54,7 @@ class TrainerConfig:
     def __init__(self, **kwargs):
         for k,v in kwargs.items():
             setattr(self, k, v)
+import torch.nn.functional as F
 
 class Trainer:
 
@@ -75,89 +77,157 @@ class Trainer:
         # torch.save(raw_model.state_dict(), self.config.ckpt_path)
 
     def train(self):
+        dt_loss_history = []
+        policy_loss_history = []
+        total_loss_history = []
+        # 记录每个 batch 的损失
+        all_batch_dt_losses = []
+        all_batch_policy_losses = []
+        all_batch_total_losses = []
+        all_eval_returns = []  # 用于记录每个 epoch 的评估得分
+        # 获取模型和配置文件
         model, config = self.model, self.config
+        # 如果模型有多个模块（比如使用了DataParallel），则获取模块中的模型，否则直接使用模型
         raw_model = model.module if hasattr(self.model, "module") else model
+        # 根据配置文件设置优化器
         optimizer = raw_model.configure_optimizers(config)
 
-        def run_epoch(split, epoch_num=0):
+        # 定义一个运行 epoch（训练轮次）的方法，split表示数据集的类型，epoch_num是当前的轮次数
+        def run_epoch(split, epoch_num=0, dt_loss_history=None, policy_loss_history=None, total_loss_history=None, batch_loss_history=None):
+            # 记录每个 batch 的损失
+            batch_dt_losses = []      # 记录每个 batch 的 DT 损失
+            batch_policy_losses = []  # 记录每个 batch 的策略损失
+            batch_total_losses = []   # 记录每个 batch 的总损失
+            
+            # 判断是训练模式还是测试模式
             is_train = split == 'train'
+            # 设置模型的模式，train(True)为训练模式，train(False)为评估模式
             model.train(is_train)
+            # 选择训练集或测试集
             data = self.train_dataset if is_train else self.test_dataset
+            # 使用DataLoader加载数据集，设置数据加载时是否打乱顺序以及一些并行处理的参数
             loader = DataLoader(data, shuffle=True, pin_memory=True,
                                 batch_size=config.batch_size,
                                 num_workers=config.num_workers)
 
+            # 保存每个batch的损失值
             losses = []
+            # 如果是训练模式，使用tqdm显示进度条；否则只枚举数据
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
+            # 遍历数据加载器，it是当前迭代次数，(x, y, r, t)是加载的数据
             for it, (x, y, r, t) in pbar:
+                # 将数据移动到指定的设备（如GPU）
+                x = x.to(self.device) #states: 状态输入 (batch, block_size, 4*84*84) torch.Size([128, 30, 28224])
+                y = y.to(self.device) # actions: 动作输入 (batch, block_size, 1) torch.Size([128, 30, 1])
+                r = r.to(self.device) # rtgs: 回报-to-go (batch, block_size, 1) torch.Size([128, 30, 1])
+                t = t.to(self.device) # timesteps: 时间步 (batch, 1, 1) 
 
-                # place data on the correct device
-                x = x.to(self.device)
-                y = y.to(self.device)
-                r = r.to(self.device)
-                t = t.to(self.device)
+                # 通过模型进行前向传播
+                with torch.set_grad_enabled(is_train):  # 只有在训练模式下才启用梯度计算
+                    # logits, dt_loss = model(x, y, y, r, t)  # 使用loss
+                    logits, dt_loss, q_values = model(x, y, y, r, t)
+                    # print('x.shape',x.shape)
+                    # print('y.shape',y.shape)
+                    # print('r.shape',r.shape)
+                    # print('t.shape',t.shape)
+                    # print('logits.shape',logits.shape) # torch.Size([128, 30, 4])
+                    # print('dt_loss.shape',dt_loss.shape) # torch.Size([])
+                    # print('q_values.shape',q_values.shape)
+                    dt_loss = dt_loss.mean()  # 确保损失是标量
+                    batch_dt_losses.append(dt_loss.item())
+                    # 以下是新增
+                    # 计算 Q 值
 
-                # forward the model
-                with torch.set_grad_enabled(is_train):
-                    # logits, loss = model(x, y, r)
-                    logits, loss = model(x, y, y, r, t)
-                    loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
-                    losses.append(loss.item())
+                    q_values = q_values.squeeze(-1)  # 形状变为 [batch_size, sequence_length]
+                    baseline = q_values.mean(dim=1, keepdim=True)
+                    advantages = q_values - baseline  # 计算优势
+
+                    # 利用优势强化 logits
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    print("log_probs shape:", log_probs.shape)  # (batch_size, sequence_length, vocab_size)
+                    print("y shape:", y.shape)                  # (batch_size, sequence_length)
+                    # 将 y 调整为 [batch_size, sequence_length]
+                    # y = y.squeeze(-1)
+                    chosen_log_probs = log_probs.gather(2, y).squeeze(-1)  # 输出维度 [batch_size, sequence_length]
+
+                    policy_loss = -(advantages * chosen_log_probs).mean(dim=-1).mean()  # 优先对 sequence_length 平均
+
+                    # policy_loss = -(advantages * chosen_log_probs).mean()  # 策略损失
+                    batch_policy_losses.append(policy_loss.item())
+                    # 使用优势加权计算最终损失 加负数的原因是 要最大化优势 就要最小化损失 
+                    total_loss = policy_loss + dt_loss  # 加上行为克隆损失
+                    batch_total_losses.append(total_loss.item())
+
+
 
                 if is_train:
-
-                    # backprop and update the parameters
-                    model.zero_grad()
-                    loss.backward()
+                    # 如果是训练模式，则执行反向传播和参数更新
+                    model.zero_grad()  # 清除前一轮的梯度
+                    total_loss.backward()  # 反向传播计算梯度
+                    # 防止梯度爆炸，进行梯度裁剪
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                    optimizer.step()
+                    optimizer.step()  # 更新参数
 
-                    # decay the learning rate based on our progress
+                    # 根据训练进度调整学习率
                     if config.lr_decay:
-                        self.tokens += (y >= 0).sum() # number of tokens processed this step (i.e. label is not -100)
+                        # 计算当前处理的tokens数量（不包括-100的标签）
+                        self.tokens += (y >= 0).sum()
                         if self.tokens < config.warmup_tokens:
-                            # linear warmup
+                            # 在预热阶段进行线性学习率上升
                             lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
                         else:
-                            # cosine learning rate decay
+                            # 在预热之后使用余弦衰减策略调整学习率
                             progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
                             lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+                        # 根据学习率的倍数调整学习率
                         lr = config.learning_rate * lr_mult
+                        # 为优化器中的每个参数组设置新的学习率
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr
                     else:
+                        # 如果不使用学习率衰减，则直接使用初始学习率
                         lr = config.learning_rate
 
-                    # report progress
-                    pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                    # 更新进度条，显示当前迭代的损失值和学习率
+                    pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {total_loss.item():.5f}. lr {lr:e}")
 
+            # 如果是测试模式，计算平均损失并记录日志
             if not is_train:
-                test_loss = float(np.mean(losses))
+                test_loss = float(np.mean(batch_total_losses))
                 logger.info("test loss: %f", test_loss)
                 return test_loss
+            # 记录 batch 级别的损失
+            if dt_loss_history is not None:
+                dt_loss_history.append(np.mean(batch_dt_losses))
+            if policy_loss_history is not None:
+                policy_loss_history.append(np.mean(batch_policy_losses))
+            if total_loss_history is not None:
+                total_loss_history.append(np.mean(batch_total_losses))
 
-        # best_loss = float('inf')
-        
+            return batch_dt_losses, batch_policy_losses, batch_total_losses  # 返回每个 batch 的损失
+                # best_return用于记录当前最好的返回值，初始值为负无穷
         best_return = -float('inf')
 
-        self.tokens = 0 # counter used for learning rate decay
+        # 初始化token计数器，用于学习率衰减
+        self.tokens = 0
 
+        # 遍历所有的训练轮次
         for epoch in range(config.max_epochs):
+            # 运行训练模式的epoch
+            batch_dt_losses, batch_policy_losses, batch_total_losses = run_epoch('train', epoch_num=epoch, 
+                                                                                   dt_loss_history=dt_loss_history,
+                                                                                   policy_loss_history=policy_loss_history,
+                                                                                   total_loss_history=total_loss_history)        # 将每个 epoch 的 batch 损失添加到总列表中
+            all_batch_dt_losses.extend(batch_dt_losses)
+            all_batch_policy_losses.extend(batch_policy_losses)
+            all_batch_total_losses.extend(batch_total_losses)
 
-            run_epoch('train', epoch_num=epoch)
-            # if self.test_dataset is not None:
-            #     test_loss = run_epoch('test')
-
-            # # supports early stopping based on the test loss, or just save always if no test set is provided
-            # good_model = self.test_dataset is None or test_loss < best_loss
-            # if self.config.ckpt_path is not None and good_model:
-            #     best_loss = test_loss
-            #     self.save_checkpoint()
-
-            # -- pass in target returns
+            # 以下是根据模型类型进行的评估流程
             if self.config.model_type == 'naive':
+                # 如果模型类型是'naive'，调用self.get_returns(0)获取返回值
                 eval_return = self.get_returns(0)
             elif self.config.model_type == 'reward_conditioned':
+                # 如果模型类型是'reward_conditioned'，根据不同的游戏环境获取对应的返回值
                 if self.config.game == 'Breakout':
                     eval_return = self.get_returns(90)
                 elif self.config.game == 'Seaquest':
@@ -167,58 +237,155 @@ class Trainer:
                 elif self.config.game == 'Pong':
                     eval_return = self.get_returns(20)
                 else:
+                    # 如果遇到未实现的游戏环境，抛出错误
                     raise NotImplementedError()
-            else:
-                raise NotImplementedError()
+                
 
+            else:
+                # 如果遇到未实现的模型类型，抛出错误
+                raise NotImplementedError()
+            all_eval_returns.append(eval_return)
+            best_return = max(eval_return,best_return)
+        self.save_train_result(dt_loss_history, policy_loss_history, total_loss_history, all_eval_returns)
+        print(f'best_return in total {config.max_epochs} epochs:{best_return}')
+        
+    def save_train_result(self, dt_losses, policy_losses, total_losses, eval_returns):
+        # Step 1: 创建 train_result 目录和 exp_n 目录
+        base_dir = "train_result"
+        os.makedirs(base_dir, exist_ok=True)
+
+        # 查找下一个可用的 exp_n 目录
+        exp_num = 1
+        exp_dir = os.path.join(base_dir, f"exp_{exp_num}")
+        while os.path.exists(exp_dir):
+            exp_num += 1
+            exp_dir = os.path.join(base_dir, f"exp_{exp_num}")
+        os.makedirs(exp_dir)
+
+        # Step 2: 绘制并保存损失对比图
+        plt.figure(figsize=(12, 6))
+        plt.plot(dt_losses, label="DT Loss", color="blue")
+        plt.plot(policy_losses, label="Policy Loss", color="orange")
+        plt.plot(total_losses, label="Total Loss", color="green")
+        plt.xlabel("Batch Iteration")
+        plt.ylabel("Loss")
+        plt.title("Loss per Batch during Training")
+        plt.legend()
+        
+        # 保存为 SVG 格式
+        plt.savefig(os.path.join(exp_dir, "losses_comparison.svg"), format='svg')
+        plt.close()
+
+        # Step 3: 保存每个 epoch 的 eval_return 到 score.txt
+        score_file_path = os.path.join(exp_dir, "score.txt")
+        with open(score_file_path, 'w') as f:
+            for epoch, return_value in enumerate(eval_returns, start=1):
+                f.write(f"epoch_{epoch} {return_value}\n")
+            
+            best_score = max(eval_returns)
+            f.write(f"best_score {best_score}\n")
+
+        print(f'整个训练结果保存成功，保存在:{exp_dir}')
+        
     def get_returns(self, ret):
-        self.model.train(False)
-        args=Args(self.config.game.lower(), self.config.seed)
+        # 将模型设置为评估模式，不启用梯度计算（train(False)），避免训练时的dropout或其他影响
+        self.model.train(False)    
+        # 初始化游戏环境的参数，包含游戏名称（转为小写）和随机种子
+        args = Args(self.config.game.lower(), self.config.seed)
+        # 创建一个环境实例，env表示游戏环境
         env = Env(args)
+        # 将环境设置为评估模式
         env.eval()
 
+        # 初始化两个列表，用于存储每次迭代的奖励（T_rewards）和Q值（T_Qs）
         T_rewards, T_Qs = [], []
+        
+        # done 表示是否完成一局游戏，初始设为True，以便开始新的游戏
         done = True
+        
+        # 执行10次评估迭代，每次迭代代表一次独立的游戏过程
         for i in range(10):
+            # 重置环境，获得初始状态
             state = env.reset()
+            # 将状态转换为浮点型，并移动到指定的设备（如GPU），并调整维度（增加批次维度和时间步维度）
             state = state.type(torch.float32).to(self.device).unsqueeze(0).unsqueeze(0)
+            
+            # 设置初始的期望回报值，rtgs 表示期望的累计回报（Return-To-Go）
             rtgs = [ret]
-            # first state is from env, first rtg is target return, and first timestep is 0
+            
+            # 使用模型进行采样，获取初始的动作。输入参数包括：
+            # - 模型
+            # - 初始状态（all_states）
+            # - 采样长度（1）
+            # - 采样温度（temperature=1.0）
+            # - 是否进行采样（sample=True）
+            # - 动作（actions=None，因为是第一次采样）
+            # - rtgs：期望的回报值，经过格式化后转为tensor
+            # - timesteps：当前的时间步（这里是0，因为是初始步）
             sampled_action = sample(self.model.module, state, 1, temperature=1.0, sample=True, actions=None, 
                 rtgs=torch.tensor(rtgs, dtype=torch.long).to(self.device).unsqueeze(0).unsqueeze(-1), 
                 timesteps=torch.zeros((1, 1, 1), dtype=torch.int64).to(self.device))
 
+            # 初始化计数器 j，用于记录当前的时间步
             j = 0
+            # all_states 用于保存所有的状态（包括初始状态），动作列表actions用于保存每次采样的动作
             all_states = state
             actions = []
+            
+            # 开始执行游戏，直到游戏结束（done为True）
             while True:
                 if done:
+                    # 如果游戏已结束，重置环境，reward_sum重置为0，并将done设置为False开始新一轮
                     state, reward_sum, done = env.reset(), 0, False
-                action = sampled_action.cpu().numpy()[0,-1]
+                
+                # 将采样得到的动作转为numpy数组，并取最后一个动作
+                action = sampled_action.cpu().numpy()[0, -1]
+                
+                # 记录当前采样的动作
                 actions += [sampled_action]
+                
+                # 使用当前动作在环境中执行一步，得到新的状态、奖励和游戏是否结束的标志
                 state, reward, done = env.step(action)
+                # 更新累计的奖励
                 reward_sum += reward
+                # 时间步增加
                 j += 1
 
+                # 如果游戏结束，则记录累计奖励并跳出循环
                 if done:
                     T_rewards.append(reward_sum)
                     break
 
+                # 更新状态，将新获得的状态添加到状态序列中
                 state = state.unsqueeze(0).unsqueeze(0).to(self.device)
-
                 all_states = torch.cat([all_states, state], dim=0)
 
+                # 更新rtgs，新的rtg是之前的rtg减去这一步的奖励
                 rtgs += [rtgs[-1] - reward]
-                # all_states has all previous states and rtgs has all previous rtgs (will be cut to block_size in utils.sample)
-                # timestep is just current timestep
+
+                # 继续使用模型进行采样，更新动作
+                # - 输入包含所有的状态（all_states）
+                # - 期望回报（rtgs）
+                # - 动作序列（actions）
+                # - 当前时间步（使用min(j, self.config.max_timestep)来限制时间步的最大值）
                 sampled_action = sample(self.model.module, all_states.unsqueeze(0), 1, temperature=1.0, sample=True, 
                     actions=torch.tensor(actions, dtype=torch.long).to(self.device).unsqueeze(1).unsqueeze(0), 
                     rtgs=torch.tensor(rtgs, dtype=torch.long).to(self.device).unsqueeze(0).unsqueeze(-1), 
                     timesteps=(min(j, self.config.max_timestep) * torch.ones((1, 1, 1), dtype=torch.int64).to(self.device)))
+        
+        # 关闭游戏环境，释放资源
         env.close()
-        eval_return = sum(T_rewards)/10.
+        
+        # 计算10次游戏的平均奖励（作为评估结果）
+        eval_return = sum(T_rewards) / 10.
+        
+        # 打印目标回报（ret）和评估得到的回报（eval_return）
         print("target return: %d, eval return: %d" % (ret, eval_return))
+        
+        # 恢复模型到训练模式
         self.model.train(True)
+        
+        # 返回评估得到的平均回报值
         return eval_return
 
 
