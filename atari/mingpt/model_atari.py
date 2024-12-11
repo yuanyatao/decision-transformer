@@ -124,8 +124,6 @@ class Block(nn.Module):
         return x
 # model_atari.py
 class QValueNetwork(nn.Module):
-    """独立的Q值网络，用于从GPT生成的状态嵌入中估计Q值。"""
-    
     def __init__(self, n_embd):
         super().__init__()
         self.q_net = nn.Sequential(
@@ -135,10 +133,19 @@ class QValueNetwork(nn.Module):
         )
 
     def forward(self, state_embeddings):
-        # 假设输入是 (batch_size, sequence_length, n_embd)
         q_values = self.q_net(state_embeddings)
         return q_values  # 返回形状为 (batch_size, sequence_length, 1)
 
+    def compute_iql_loss(self, q_values, actions):
+        # IQL 的损失函数
+        baseline = q_values.mean(dim=1, keepdim=True)  # 使用均值作为 baseline
+        adv = q_values - baseline  # 计算优势
+        # 计算优势加权的损失
+        weights = torch.exp(adv)  # 直接用 exp(advantage) 计算权重会更稳定
+        # weights = torch.sigmoid(adv)  # 使用 sigmoid 进行权重缩放0~1
+        iql_loss = -torch.mean(weights * F.log_softmax(q_values, dim=-1).gather(-1, actions))
+        return iql_loss
+    
 class GPT(nn.Module):
     """GPT 模型，具有指定上下文长度 block_size，用于强化学习中的序列建模。"""
 
@@ -163,6 +170,7 @@ class GPT(nn.Module):
 
         self.block_size = config.block_size  # 上下文长度（block_size）。
         self.apply(self._init_weights)  # 初始化模型权重。
+        self.ad_iql = False
 
         # 打印模型参数数量。
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
@@ -328,6 +336,7 @@ class GPT(nn.Module):
             raise NotImplementedError()
         # # 计算 Q 值
         q_values = self.q_value_net(x)
+        
         # 如果提供了目标动作标签，计算交叉熵损失
         loss = None
         if targets is not None:

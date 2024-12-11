@@ -1,1 +1,4 @@
 dqn_replay/
+*.pkl
+*.zip
+*.pyc

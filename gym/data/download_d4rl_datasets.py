@@ -5,13 +5,29 @@ import collections
 import pickle
 
 import d4rl
+import gym
+
+# 打印所有注册的环境 ID
+import gym
+
+# 兼容新的 gym 版本
+try:
+    env_list = [env_spec.id for env_spec in gym.envs.registry.items()]
+except AttributeError:
+    env_list = [env_spec.id for env_spec in gym.envs.registry.values()]
+
+print(f"Registered environments ({len(env_list)}):")
+print("\n".join(env_list))
+
 
 
 datasets = []
 
-for env_name in ['halfcheetah', 'hopper', 'walker2d']:
-	for dataset_type in ['medium', 'medium-replay', 'expert']:
-		name = f'{env_name}-{dataset_type}-v2'
+# for env_name in ['halfcheetah', 'hopper', 'walker2d']:
+for env_name in ['bullet-hopper']:
+	for dataset_type in ['medium']:
+	# for dataset_type in ['medium', 'medium-replay', 'expert']:
+		name = f'{env_name}-{dataset_type}-v0'
 		env = gym.make(name)
 		dataset = env.get_dataset()
 

@@ -141,7 +141,7 @@ class Trainer:
                     q_values = q_values.squeeze(-1)  # 形状变为 [batch_size, sequence_length]
                     baseline = q_values.mean(dim=1, keepdim=True)
                     advantages = q_values - baseline  # 计算优势
-
+                    weights = torch.exp(advantages)
                     # 利用优势强化 logits
                     log_probs = F.log_softmax(logits, dim=-1)
                     print("log_probs shape:", log_probs.shape)  # (batch_size, sequence_length, vocab_size)
@@ -150,7 +150,7 @@ class Trainer:
                     # y = y.squeeze(-1)
                     chosen_log_probs = log_probs.gather(2, y).squeeze(-1)  # 输出维度 [batch_size, sequence_length]
 
-                    policy_loss = -(advantages * chosen_log_probs).mean(dim=-1).mean()  # 优先对 sequence_length 平均
+                    policy_loss = -(weights * chosen_log_probs).mean(dim=-1).mean()  # 优先对 sequence_length 平均
 
                     # policy_loss = -(advantages * chosen_log_probs).mean()  # 策略损失
                     batch_policy_losses.append(policy_loss.item())
@@ -405,6 +405,7 @@ class Env():
         self.life_termination = False  # Used to check if resetting only from loss of life
         self.window = args.history_length  # Number of frames to concatenate
         self.state_buffer = deque([], maxlen=args.history_length)
+        
         self.training = True  # Consistent with model training mode
 
     def _get_state(self):

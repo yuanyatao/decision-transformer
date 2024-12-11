@@ -103,41 +103,41 @@ logging.basicConfig(
         level=logging.INFO,
 )
 
-# # 创建训练数据集实例
-# # train_dataset = StateActionReturnDataset(obss, args.context_length*3, actions, done_idxs, rtgs, timesteps)
-# # 创建随机数据集实例
-# train_dataset = RandomDataset(args.num_samples, args.context_length)
-# # 配置 GPT 模型的参数
-# mconf = GPTConfig(train_dataset.vocab_size, train_dataset.block_size,
-#                   n_layer=6, n_head=8, n_embd=128, model_type=args.model_type, max_timestep=max(timesteps))
-# # 初始化 GPT 模型
-# model = GPT(mconf)
-
-# # 配置训练器的参数
-# tconf = TrainerConfig(max_epochs=args.epochs, batch_size=args.batch_size, learning_rate=6e-4,
-#                       lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset)*args.context_length*3,
-#                       num_workers=0, seed=args.seed, model_type=args.model_type, game=args.game, max_timestep=max(timesteps))
-# # 初始化训练器实例，并开始训练
-# trainer = Trainer(model, train_dataset, None, tconf)
-
-# # 开始模型的训练过程
-# trainer.train()
+# 创建训练数据集实例
+# train_dataset = StateActionReturnDataset(obss, args.context_length*3, actions, done_idxs, rtgs, timesteps)
 # 创建随机数据集实例
 train_dataset = RandomDataset(args.num_samples, args.context_length)
-
 # 配置 GPT 模型的参数
-mconf = GPTConfig(train_dataset.actions.max() + 1, train_dataset.block_size,
-                  n_layer=6, n_head=8, n_embd=128, model_type=args.model_type, max_timestep=train_dataset.timesteps.max())
+mconf = GPTConfig(train_dataset.vocab_size, train_dataset.block_size,
+                  n_layer=6, n_head=8, n_embd=128, model_type=args.model_type, max_timestep=max(timesteps))
 # 初始化 GPT 模型
 model = GPT(mconf)
 
 # 配置训练器的参数
 tconf = TrainerConfig(max_epochs=args.epochs, batch_size=args.batch_size, learning_rate=6e-4,
-                      lr_decay=True, warmup_tokens=512 * 20, final_tokens=2 * len(train_dataset) * args.context_length * 3,
-                      num_workers=0, seed=args.seed, model_type=args.model_type)
-
+                      lr_decay=True, warmup_tokens=512*20, final_tokens=2*len(train_dataset)*args.context_length*3,
+                      num_workers=0, seed=args.seed, model_type=args.model_type, game=args.game, max_timestep=max(timesteps))
 # 初始化训练器实例，并开始训练
 trainer = Trainer(model, train_dataset, None, tconf)
 
 # 开始模型的训练过程
 trainer.train()
+# # 创建随机数据集实例
+# train_dataset = RandomDataset(args.num_samples, args.context_length)
+
+# # 配置 GPT 模型的参数
+# mconf = GPTConfig(train_dataset.actions.max() + 1, train_dataset.block_size,
+#                   n_layer=6, n_head=8, n_embd=128, model_type=args.model_type, max_timestep=train_dataset.timesteps.max())
+# # 初始化 GPT 模型
+# model = GPT(mconf)
+
+# # 配置训练器的参数
+# tconf = TrainerConfig(max_epochs=args.epochs, batch_size=args.batch_size, learning_rate=6e-4,
+#                       lr_decay=True, warmup_tokens=512 * 20, final_tokens=2 * len(train_dataset) * args.context_length * 3,
+#                       num_workers=0, seed=args.seed, model_type=args.model_type)
+
+# # 初始化训练器实例，并开始训练
+# trainer = Trainer(model, train_dataset, None, tconf)
+
+# # 开始模型的训练过程
+# trainer.train()
